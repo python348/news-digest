@@ -463,7 +463,7 @@ def main():
     post_to_slack(message)
 
     # 5. 重複排除データ保存
-    save_seen(seen)
+    # save_seen(seen)
     log.info("完了")
 
 

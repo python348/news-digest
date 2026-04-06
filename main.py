@@ -1,13 +1,12 @@
 """
-デイリーニュースダイジェスト自動配信システム
+デイリーニュースダイジェスト自動配信システム v2
 =============================================
 毎日JST 8:00にSlackへ「要約＋解説＋出典リンク」を配信する。
 
 カテゴリ:
   - AI関連（Claude, Gemini, ChatGPT等）
-  - 地震（日本: 震度3以上, 海外: M6.0以上）
-  - 天文現象
-  - 新種発見・科学ニュース
+  - 国内主要ニュース（政治・経済・社会）
+  - 理科系トピック（地震・天文・気象・新発見をまとめて表示）
 
 実行基盤: GitHub Actions (cron)
 要約生成: Groq API (llama-3.3-70b-versatile)
@@ -20,6 +19,7 @@ import hashlib
 import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from collections import Counter
 
 import feedparser
 import requests
@@ -34,7 +34,6 @@ log = logging.getLogger(__name__)
 # ── 環境変数 ─────────────────────────────────
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
-# Groqモデル（無料枠で使えるモデル）
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 # ── 定数 ──────────────────────────────────────
@@ -42,30 +41,29 @@ JST = timezone(timedelta(hours=9))
 NOW = datetime.now(JST)
 YESTERDAY = NOW - timedelta(hours=24)
 
-# 重複排除用ファイル
-SEEN_FILE = Path(__file__).parent / "data" / "seen.json"
-
-# ── カテゴリ絵文字 ─────────────────────────────
+# ── カテゴリ設定 ──────────────────────────────
 EMOJI = {
     "ai": "🤖",
-    "earthquake": "🌏",
-    "astronomy": "🔭",
-    "discovery": "🔬",
+    "domestic": "📰",
+    "science": "🔬",
 }
 
 CATEGORY_NAMES = {
     "ai": "AI関連",
-    "earthquake": "地震",
-    "astronomy": "天文現象",
-    "discovery": "新発見",
+    "domestic": "国内主要ニュース",
+    "science": "理科系トピック",
 }
+
+# 1ソースあたりの最大記事数（偏り防止）
+MAX_PER_SOURCE = 2
 
 
 # =============================================
 # 1. 情報収集
 # =============================================
 
-def fetch_rss(url: str, category: str, keywords: list[str] | None = None) -> list[dict]:
+def fetch_rss(url: str, category: str, keywords: list[str] | None = None,
+              exclude_keywords: list[str] | None = None) -> list[dict]:
     """RSSフィードから直近24時間の記事を取得する。"""
     articles = []
     try:
@@ -80,24 +78,28 @@ def fetch_rss(url: str, category: str, keywords: list[str] | None = None) -> lis
                     published = datetime.fromtimestamp(mktime(t), tz=timezone.utc)
                     break
 
-            # 日時が取れない場合は含める（新着の可能性）
             if published and published < YESTERDAY:
                 continue
 
             title = getattr(entry, "title", "")
             summary = getattr(entry, "summary", "")
             link = getattr(entry, "link", "")
+            text = (title + " " + summary).lower()
 
             # キーワードフィルタ（指定がある場合のみ）
             if keywords:
-                text = (title + " " + summary).lower()
                 if not any(kw.lower() in text for kw in keywords):
+                    continue
+
+            # 除外キーワード
+            if exclude_keywords:
+                if any(kw.lower() in text for kw in exclude_keywords):
                     continue
 
             articles.append({
                 "category": category,
                 "title": title,
-                "summary": summary[:500],  # 長すぎる要約をカット
+                "summary": summary[:500],
                 "link": link,
                 "source": feed.feed.get("title", url),
             })
@@ -109,7 +111,6 @@ def fetch_rss(url: str, category: str, keywords: list[str] | None = None) -> lis
 def fetch_earthquake_jma() -> list[dict]:
     """
     気象庁の地震情報をJSON APIから取得する。
-    ソース: https://www.jma.go.jp/bosai/quake/data/list.json
     震度3以上のみ抽出。
     """
     articles = []
@@ -119,8 +120,7 @@ def fetch_earthquake_jma() -> list[dict]:
         resp.raise_for_status()
         quakes = resp.json()
 
-        for q in quakes[:50]:  # 最新50件を確認
-            # 時刻フィルタ
+        for q in quakes[:50]:
             time_str = q.get("at", "")
             if not time_str:
                 continue
@@ -131,9 +131,7 @@ def fetch_earthquake_jma() -> list[dict]:
             if qt < YESTERDAY:
                 continue
 
-            # 震度フィルタ（震度3以上）
             max_int = q.get("max_int", "")
-            # 気象庁形式: "1", "2", "3", "4", "5-", "5+", "6-", "6+", "7"
             int_value = max_int.replace("-", "").replace("+", "")
             try:
                 if int(int_value) < 3:
@@ -141,20 +139,14 @@ def fetch_earthquake_jma() -> list[dict]:
             except (ValueError, TypeError):
                 continue
 
-            title = q.get("ttl", "地震情報")
-            # 詳細URL
-            code = q.get("ctt", "")
-            detail_url = f"https://www.jma.go.jp/bosai/quake/"
-
             hypo = q.get("anm", "不明")
             mag = q.get("mag", "不明")
-
-            summary = f"震源: {hypo} / 最大震度{max_int} / M{mag} / {time_str}"
+            detail_url = "https://www.jma.go.jp/bosai/quake/"
 
             articles.append({
-                "category": "earthquake",
-                "title": f"{hypo}で震度{max_int}（M{mag}）",
-                "summary": summary,
+                "category": "science",
+                "title": f"🌏 {hypo}で震度{max_int}（M{mag}）",
+                "summary": f"震源: {hypo} / 最大震度{max_int} / M{mag} / {time_str}",
                 "link": detail_url,
                 "source": "気象庁",
             })
@@ -164,10 +156,7 @@ def fetch_earthquake_jma() -> list[dict]:
 
 
 def fetch_earthquake_usgs() -> list[dict]:
-    """
-    USGS Earthquake API から M6.0以上の地震を取得する。
-    https://earthquake.usgs.gov/fdsnws/event/1/
-    """
+    """USGS Earthquake API から M6.0以上の地震を取得する。"""
     articles = []
     start = YESTERDAY.strftime("%Y-%m-%dT%H:%M:%S")
     url = (
@@ -188,8 +177,8 @@ def fetch_earthquake_usgs() -> list[dict]:
             qt = datetime.fromtimestamp(time_ms / 1000, tz=timezone.utc)
 
             articles.append({
-                "category": "earthquake",
-                "title": f"海外地震: {place}（M{mag}）",
+                "category": "science",
+                "title": f"🌏 海外地震: {place}（M{mag}）",
                 "summary": f"場所: {place} / M{mag} / {qt.astimezone(JST).strftime('%m/%d %H:%M JST')}",
                 "link": detail_url,
                 "source": "USGS",
@@ -202,43 +191,58 @@ def fetch_earthquake_usgs() -> list[dict]:
 # ── RSSソース定義 ──────────────────────────────
 
 RSS_SOURCES = [
-    # --- AI関連 ---
+    # ━━━ AI関連 ━━━
     {"url": "https://www.anthropic.com/feed.xml", "category": "ai"},
     {"url": "https://blog.google/technology/ai/rss/", "category": "ai"},
     {"url": "https://openai.com/blog/rss.xml", "category": "ai"},
     {"url": "https://www.itmedia.co.jp/news/subtop/aiplus/rss/index.xml", "category": "ai"},
     {"url": "https://gigazine.net/news/rss_2.0/", "category": "ai",
-     "keywords": ["AI", "人工知能", "ChatGPT", "Claude", "Gemini", "LLM", "GPT", "機械学習"]},
-    {"url": "https://feed.infoq.com/", "category": "ai",
-     "keywords": ["AI", "LLM", "machine learning", "Claude", "Gemini", "GPT"]},
+     "keywords": ["ChatGPT", "Claude", "Gemini", "LLM", "GPT-", "OpenAI",
+                   "Anthropic", "Google AI", "生成AI", "大規模言語モデル",
+                   "Copilot", "Midjourney", "Stable Diffusion", "Suno",
+                   "機械学習", "ディープラーニング"],
+     "exclude_keywords": ["マラソン", "ランナー", "レシピ", "料理", "ダイエット"]},
+    {"url": "https://techcrunch.com/category/artificial-intelligence/feed/", "category": "ai"},
+    {"url": "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml", "category": "ai"},
 
-    # --- 天文現象 ---
-    {"url": "https://www.nao.ac.jp/rss/atom.xml", "category": "astronomy"},
-    {"url": "https://www.astroarts.co.jp/article/feed.xml", "category": "astronomy"},
-    {"url": "https://spaceweather.com/rssnews.php", "category": "astronomy"},
+    # ━━━ 国内主要ニュース ━━━
+    {"url": "https://www.nhk.or.jp/rss/news/cat0.xml", "category": "domestic"},
+    {"url": "https://news.yahoo.co.jp/rss/topics/top-picks.xml", "category": "domestic"},
+    {"url": "https://www3.nhk.or.jp/rss/news/cat1.xml", "category": "domestic"},
+    {"url": "https://www3.nhk.or.jp/rss/news/cat3.xml", "category": "domestic"},
 
-    # --- 新発見 ---
-    {"url": "http://feeds.nature.com/nature/rss/current", "category": "discovery",
-     "keywords": ["new species", "新種", "discovery", "発見", "fossil", "化石"]},
-    {"url": "https://www.eurekalert.org/rss/technology_engineering.xml", "category": "discovery",
-     "keywords": ["species", "discovery", "fossil", "ocean", "biodiversity"]},
-    {"url": "https://natgeo.nikkeibp.co.jp/atcl/news/feed/rss.xml", "category": "discovery",
-     "keywords": ["新種", "発見", "化石", "生物", "深海"]},
+    # ━━━ 理科系トピック ━━━
+    {"url": "https://www.nao.ac.jp/rss/atom.xml", "category": "science"},
+    {"url": "https://www.astroarts.co.jp/article/feed.xml", "category": "science"},
+    {"url": "https://spaceweather.com/rssnews.php", "category": "science"},
+    {"url": "https://www3.nhk.or.jp/rss/news/cat0.xml", "category": "science",
+     "keywords": ["台風", "大雨", "暴風", "洪水", "津波", "噴火", "火山",
+                   "竜巻", "猛暑", "熱中症", "大雪", "警報"]},
+    {"url": "http://feeds.nature.com/nature/rss/current", "category": "science",
+     "keywords": ["new species", "新種", "discovery", "発見", "fossil", "化石",
+                   "asteroid", "小惑星", "exoplanet", "系外惑星", "earthquake",
+                   "volcano", "climate"]},
+    {"url": "https://www.eurekalert.org/rss/technology_engineering.xml", "category": "science",
+     "keywords": ["species", "discovery", "fossil", "ocean", "biodiversity",
+                   "earthquake", "volcano", "asteroid", "comet"]},
+    {"url": "https://natgeo.nikkeibp.co.jp/atcl/news/feed/rss.xml", "category": "science",
+     "keywords": ["新種", "発見", "化石", "生物", "深海", "火山", "地震",
+                   "天文", "宇宙", "気象", "恐竜"]},
 ]
 
 
 def collect_all_articles() -> list[dict]:
     """全ソースから記事を収集する。"""
     articles = []
-
-    # RSS
     for src in RSS_SOURCES:
         log.info(f"取得中: {src['url']}")
-        arts = fetch_rss(src["url"], src["category"], src.get("keywords"))
+        arts = fetch_rss(
+            src["url"], src["category"],
+            src.get("keywords"), src.get("exclude_keywords"),
+        )
         articles.extend(arts)
         log.info(f"  → {len(arts)}件")
 
-    # 地震（専用API）
     log.info("取得中: 気象庁 地震情報")
     jma = fetch_earthquake_jma()
     articles.extend(jma)
@@ -253,49 +257,38 @@ def collect_all_articles() -> list[dict]:
 
 
 # =============================================
-# 2. 重複排除
+# 2. ソース偏り防止 & 重複排除
 # =============================================
 
-def load_seen() -> set[str]:
-    """過去に配信済みの記事URLハッシュを読み込む。"""
-    if SEEN_FILE.exists():
-        try:
-            data = json.loads(SEEN_FILE.read_text())
-            return set(data.get("seen", []))
-        except Exception:
-            pass
-    return set()
-
-
-def save_seen(seen: set[str]):
-    """配信済みハッシュを保存する。"""
-    SEEN_FILE.parent.mkdir(parents=True, exist_ok=True)
-    # 直近7日分だけ保持（際限なく増えないように）
-    # ハッシュは短いので7日分でも数百件程度
-    SEEN_FILE.write_text(json.dumps({"seen": list(seen)[-2000:]}, ensure_ascii=False))
-
-
-def url_hash(url: str) -> str:
-    return hashlib.md5(url.encode()).hexdigest()
-
-
-def deduplicate(articles: list[dict], seen: set[str]) -> list[dict]:
-    """重複を排除し、新規記事のみ返す。"""
-    new_articles = []
+def limit_per_source(articles: list[dict]) -> list[dict]:
+    """同一ソースからの記事数を制限する。"""
+    source_count: Counter = Counter()
+    result = []
     for art in articles:
-        h = url_hash(art["link"])
-        if h not in seen:
-            seen.add(h)
-            new_articles.append(art)
-    return new_articles
+        source = art["source"]
+        if source_count[source] < MAX_PER_SOURCE:
+            result.append(art)
+            source_count[source] += 1
+    return result
+
+
+def deduplicate_by_title(articles: list[dict]) -> list[dict]:
+    """タイトルが類似する記事を除外する（完全一致ベース）。"""
+    seen_titles: set[str] = set()
+    result = []
+    for art in articles:
+        normalized = art["title"].strip().lower()
+        if normalized not in seen_titles:
+            seen_titles.add(normalized)
+            result.append(art)
+    return result
 
 
 # =============================================
 # 3. LLMで要約・解説生成（Groq API）
 # =============================================
 
-SUMMARIZE_PROMPT = """\
-あなたはニュースキュレーターです。以下の記事情報を日本語で要約してください。
+SUMMARIZE_PROMPT = """あなたはニュースキュレーターです。以下の記事情報を日本語で要約してください。
 
 ## ルール
 - 「要約」は2〜3行で、何が起きたかを簡潔に説明する
@@ -321,7 +314,6 @@ URL: {link}
 def summarize_with_groq(article: dict) -> dict:
     """Groq APIで記事を要約する。"""
     if not GROQ_API_KEY:
-        # APIキーがない場合はそのまま返す
         return {
             "summary": article["summary"][:200],
             "insight": "（LLM要約なし：GROQ_API_KEY未設定）",
@@ -387,10 +379,13 @@ def build_slack_message(articles: list[dict]) -> str:
     date_str = NOW.strftime(f"%Y/%m/%d（{wd}）")
     lines = [f"🗞️ *デイリーニュースダイジェスト*（{date_str}）\n"]
 
-    for cat_key in ["ai", "earthquake", "astronomy", "discovery"]:
+    for cat_key in ["ai", "domestic", "science"]:
         emoji = EMOJI[cat_key]
         name = CATEGORY_NAMES[cat_key]
         cat_articles = [a for a in articles if a["category"] == cat_key]
+
+        if cat_key == "science" and not cat_articles:
+            continue
 
         lines.append(f"{'━' * 20}")
         lines.append(f"{emoji} *{name}*")
@@ -400,7 +395,6 @@ def build_slack_message(articles: list[dict]) -> str:
             lines.append("該当なし\n")
             continue
 
-        # 1カテゴリ最大5件に制限
         for art in cat_articles[:5]:
             lines.append(f"*{art['title']}*")
             lines.append(art.get("ai_summary", art["summary"][:200]))
@@ -408,7 +402,7 @@ def build_slack_message(articles: list[dict]) -> str:
             if insight:
                 lines.append(f"💡 {insight}")
             lines.append(f"🔗 {art['link']}")
-            lines.append("")  # 空行
+            lines.append("")
 
     lines.append(f"_配信時刻: {NOW.strftime('%H:%M JST')}_")
     return "\n".join(lines)
@@ -446,24 +440,18 @@ def main():
     log.info(f"現在時刻: {NOW.isoformat()}")
     log.info("=" * 50)
 
-    # 1. 収集
     articles = collect_all_articles()
     log.info(f"収集完了: 全{len(articles)}件")
 
-    # 2. 重複排除
-    seen = load_seen()
-    articles = deduplicate(articles, seen)
-    log.info(f"重複排除後: {len(articles)}件")
+    articles = deduplicate_by_title(articles)
+    articles = limit_per_source(articles)
+    log.info(f"フィルタ後: {len(articles)}件")
 
-    # 3. LLM要約
     articles = enrich_articles(articles)
 
-    # 4. Slack投稿
     message = build_slack_message(articles)
     post_to_slack(message)
 
-    # 5. 重複排除データ保存
-    # save_seen(seen)
     log.info("完了")
 
 

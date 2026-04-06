@@ -1,0 +1,51 @@
+# .github/workflows/daily-digest.yml
+# 毎日 JST 8:00 (= UTC 23:00 前日) に実行
+# 手動実行も可能（workflow_dispatch）
+
+name: Daily News Digest
+
+on:
+  schedule:
+    # UTC 23:00 = JST 08:00
+    - cron: '0 23 * * *'
+  workflow_dispatch:  # 手動実行ボタン
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: リポジトリをチェックアウト
+        uses: actions/checkout@v4
+
+      - name: Python セットアップ
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 依存パッケージインストール
+        run: pip install -r requirements.txt
+
+      - name: ニュースダイジェスト実行
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: python main.py
+
+      # 重複排除データを保存（git commit & push）
+      - name: 重複排除データを保存
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/seen.json
+          git diff --staged --quiet || git commit -m "Update seen articles $(date -u +%Y-%m-%d)"
+          git push
+
+      # 失敗時にSlackへエラー通知
+      - name: エラー通知
+        if: failure()
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+            --data '{"text":"⚠️ デイリーニュースダイジェストの実行に失敗しました。\nGitHub Actions: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"}' \
+            ${{ secrets.SLACK_WEBHOOK_URL }}

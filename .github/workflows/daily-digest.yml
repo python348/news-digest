@@ -13,6 +13,9 @@ jobs:
     steps:
       - name: リポジトリをチェックアウト
         uses: actions/checkout@v5
+        with:
+          ref: main
+          token: ${{ github.token }}
 
       - name: Python セットアップ
         uses: actions/setup-python@v6
@@ -32,8 +35,9 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          git pull --rebase origin main
           git add data/seen.json
-          git diff --staged --quiet || (git commit -m "Update seen articles $(date -u +%Y-%m-%d)" && git push --force)
+          git diff --staged --quiet || (git commit -m "Update seen articles $(date -u +%Y-%m-%d)" && git push origin main)
 
       - name: エラー通知
         if: failure()

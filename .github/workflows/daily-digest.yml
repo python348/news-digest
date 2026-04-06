@@ -1,14 +1,9 @@
-# .github/workflows/daily-digest.yml
-# 毎日 JST 8:00 (= UTC 23:00 前日) に実行
-# 手動実行も可能（workflow_dispatch）
-
 name: Daily News Digest
 
 on:
   schedule:
-    # UTC 23:00 = JST 08:00
     - cron: '0 23 * * *'
-  workflow_dispatch:  # 手動実行ボタン
+  workflow_dispatch:
 
 jobs:
   digest:
@@ -33,16 +28,15 @@ jobs:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: python main.py
 
-      # 重複排除データを保存（git commit & push）
       - name: 重複排除データを保存
         run: |
+          git pull --rebase origin main
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add data/seen.json
           git diff --staged --quiet || git commit -m "Update seen articles $(date -u +%Y-%m-%d)"
           git push
 
-      # 失敗時にSlackへエラー通知
       - name: エラー通知
         if: failure()
         run: |

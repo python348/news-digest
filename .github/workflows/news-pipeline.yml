@@ -1,0 +1,54 @@
+# .github/workflows/news-pipeline.yml
+# JST 7:00 / 13:00 / 19:00 に実行（= UTC 22:00 / 04:00 / 10:00）
+# 手動実行も可能（workflow_dispatch）
+
+name: News Pipeline
+
+on:
+  schedule:
+    - cron: '0 22 * * *'   # JST 07:00（朝刊）
+    - cron: '0 4 * * *'    # JST 13:00（昼刊）
+    - cron: '0 10 * * *'   # JST 19:00（夕刊）
+  workflow_dispatch:
+
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: リポジトリをチェックアウト
+        uses: actions/checkout@v4
+
+      - name: Python セットアップ
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 依存パッケージインストール
+        run: pip install -r requirements.txt
+
+      - name: パイプライン実行
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: bash news-pipeline.sh
+
+      # 重複排除データを保存（git commit & push）
+      - name: 重複排除データを保存
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/seen.json
+          git diff --staged --quiet || git commit -m "Update seen $(date -u +%Y-%m-%dT%H:%M)"
+          git push
+
+      # 失敗時にSlackへエラー通知
+      - name: エラー通知
+        if: failure()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\"⚠️ ニュースパイプライン失敗\\nRun: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
+            "$SLACK_WEBHOOK_URL"
